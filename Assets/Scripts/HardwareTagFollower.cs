@@ -1,72 +1,94 @@
 using UnityEngine;
+using UnityEngine.Networking;
+using System.Collections;
+using System.Collections.Generic;
+using Newtonsoft.Json.Linq; 
 
-public class HardwareTagFollower : MonoBehaviour
+public class SpatialDigitalTwin : MonoBehaviour
 {
-    [Header("하드웨어 통신 데이터")]
-    public Vector3 targetPosition; // 태그에서 수신받은 최신 목표 좌표
-
-    [Header("부드러운 이동 설정")]
-    public float moveSpeed = 10f;    // 목표 위치를 따라붙는 속도 (수치가 클수록 딱딱하게 붙음)
-    public float rotationSpeed = 15f; // 캐릭터가 이동 방향으로 고개를 돌리는 속도
-
-    private Animator _animator;
+    [Header("Server Connection")]
+    public string serverIp = "192.168.100.1"; 
+    public string port = "8000";
     
-    // StarterAssets 애니메이션 조작을 위한 ID 캐싱
-    private int _animIDSpeed;
-    private int _animIDMotionSpeed;
-    private int _animIDGrounded;
+    [Header("Sync Settings")]
+    public float lerpSpeed = 15f;
+    public float rotationSensitivity = 15f;
 
-    void Start()
-    {
-        _animator = GetComponent<Animator>();
-        
-        // 문자열로 애니메이터를 조작하면 느리므로 Hash ID로 변환해둡니다.
-        _animIDSpeed = Animator.StringToHash("Speed");
-        _animIDMotionSpeed = Animator.StringToHash("MotionSpeed");
-        _animIDGrounded = Animator.StringToHash("Grounded");
+    private string syncUrl;
 
-        // 허공에서 허우적거리지 않도록 무조건 땅에 닿아있다고 설정
-        if (_animator != null) _animator.SetBool(_animIDGrounded, true);
-
-        // 게임 시작 시 목표 위치를 현재 위치로 동기화
-        targetPosition = transform.position; 
+    void Start() {
+        syncUrl = $"http://{serverIp}:{port}/api/sync";
+        StartCoroutine(SyncLoop());
     }
 
-    void Update()
-    {
-        // 1. 이동 방향과 거리 계산
-        Vector3 direction = targetPosition - transform.position;
-        direction.y = 0; // 위아래(높이)로 고개가 꺾이는 현상 방지
-        
-        float distance = direction.magnitude;
-
-        // 2. 부드러운 위치 이동 (Lerp 보간법)
-        // 현재 위치에서 목표 위치(targetPosition)를 향해 부드럽게 미끄러지듯 이동합니다.
-        transform.position = Vector3.Lerp(transform.position, targetPosition, Time.deltaTime * moveSpeed);
-
-        // 3. 이동하는 방향을 자연스럽게 바라보도록 회전
-        if (distance > 0.05f) // 제자리에 있을 때는 덜덜거리지 않게 회전 정지
-        {
-            Quaternion targetRotation = Quaternion.LookRotation(direction);
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * rotationSpeed);
-        }
-
-        // 4. 애니메이션 재생 (걷기/뛰기 모션)
-        if (_animator != null)
-        {
-            // 목표점까지의 거리가 멀수록 애니메이션 속도(Speed)를 높여서 뛰게 만들고,
-            // 목표점에 다다르면(거리가 0에 가까워지면) 자동으로 멈춤(Idle) 모션이 나옵니다.
-            float animationSpeed = Mathf.Clamp(distance * 5f, 0f, 6f); 
-            
-            _animator.SetFloat(_animIDSpeed, animationSpeed);
-            _animator.SetFloat(_animIDMotionSpeed, 1f); // 재생 배율
+    IEnumerator SyncLoop() {
+        while (true) {
+            using (UnityWebRequest request = UnityWebRequest.Get(syncUrl)) {
+                yield return request.SendWebRequest();
+                if (request.result == UnityWebRequest.Result.Success) {
+                    UpdateUnityScene(request.downloadHandler.text);
+                }
+            }
+            yield return new WaitForSeconds(0.05f); 
         }
     }
 
-    // 💡 중요: 하드웨어에서 새로운 좌표 신호가 들어올 때마다 외부 스크립트에서 이 함수를 실행해주세요!
-    public void UpdateHardwarePosition(Vector3 newTagPosition)
-    {
-        // 들어온 좌표를 즉시 적용하지 않고 '목표 좌표'로만 갱신합니다.
-        targetPosition = newTagPosition; 
+    void UpdateUnityScene(string json) {
+        try {
+            JObject data = JObject.Parse(json);
+            JObject mappings = data["mappings"] as JObject;
+            JObject tags = data["tags"] as JObject;
+            JObject draggingStates = data["is_dragging"] as JObject;
+            JArray assets = data["assets"] as JArray;
+
+            if (mappings == null || tags == null) return;
+
+            foreach (var mapping in mappings) {
+                string tagId = mapping.Key;
+                int assetIndex = (int)mapping.Value;
+                string targetName = (string)assets[assetIndex]["name"];
+                GameObject targetObj = GameObject.Find(targetName);
+
+                if (targetObj != null && tags.ContainsKey(tagId)) {
+                    bool isDragging = (bool)draggingStates[tagId];
+                    float tagX = (float)tags[tagId]["x"];
+                    float tagZ = (float)tags[tagId]["z"];
+                    float tagY = targetObj.transform.position.y; 
+
+                    Vector3 realWorldPos = new Vector3(tagX, tagY, tagZ);
+                    
+                    // 해당 오브젝트가 사람 캐릭터인지(HardwareTagFollower가 있는지) 확인
+                    HardwareTagFollower follower = targetObj.GetComponent<HardwareTagFollower>();
+
+                    if (isDragging) {
+                        if (follower != null) {
+                            // 🚶 [사람 캐릭터 처리] 
+                            // 목표 위치만 넘겨주면 걷기 애니메이션과 회전은 Follower가 알아서 자연스럽게 처리함
+                            follower.UpdateHardwarePosition(realWorldPos);
+                        } 
+                        else {
+                            // 📦 [일반 사물 처리 (상자, 소화기 등)] 
+                            // 부드러운 위치 이동
+                            targetObj.transform.position = Vector3.Lerp(targetObj.transform.position, realWorldPos, Time.deltaTime * lerpSpeed);
+
+                            // 사물은 MPU 센서의 기울기(ax, az)를 그대로 적용하여 회전
+                            float ax = (float)tags[tagId]["ax"];
+                            float az = (float)tags[tagId]["az"];
+                            Quaternion targetRotation = Quaternion.Euler(ax * rotationSensitivity, 0, az * rotationSensitivity);
+                            targetObj.transform.rotation = Quaternion.Lerp(targetObj.transform.rotation, targetRotation, Time.deltaTime * lerpSpeed);
+                        }
+                    }
+                    else {
+                        // 버튼을 뗐을 때 (멈춤 상태 처리)
+                        if (follower != null) {
+                            // 캐릭터는 현재 위치를 목표로 설정하여 애니메이션을 멈춤(Idle) 상태로 전환
+                            follower.UpdateHardwarePosition(targetObj.transform.position);
+                        }
+                    }
+                }
+            }
+        } catch (System.Exception e) { 
+            Debug.LogError("JSON 파싱 또는 적용 중 에러 발생: " + e.Message);
+        }
     }
 }
